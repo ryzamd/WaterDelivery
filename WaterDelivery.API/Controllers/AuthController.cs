@@ -1,5 +1,10 @@
-﻿using Microsoft.AspNetCore.Mvc;
+﻿// WaterDelivery.API/Controllers/AuthController.cs
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Google;
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using System.Security.Claims;
+using WaterDelivery.API.DTOs;
 using WaterDelivery.Application.Interfaces;
 using WaterDelivery.Domain.Entities;
 using WaterDelivery.Infrastructure.Data;
@@ -15,19 +20,22 @@ namespace WaterDelivery.API.Controllers
         private readonly IPasswordService _passwordService;
         private readonly IOtpService _otpService;
         private readonly ISmsService _smsService;
+        private readonly IEmailService _emailService;
 
         public AuthController(
             ApplicationDbContext context,
             IJwtService jwtService,
             IPasswordService passwordService,
             IOtpService otpService,
-            ISmsService smsService)
+            ISmsService smsService,
+            IEmailService emailService)
         {
             _context = context;
             _jwtService = jwtService;
             _passwordService = passwordService;
             _otpService = otpService;
             _smsService = smsService;
+            _emailService = emailService;
         }
 
         [HttpPost("register/username")]
@@ -75,8 +83,10 @@ namespace WaterDelivery.API.Controllers
 
             await _context.SaveChangesAsync();
 
-            // TODO: Send email verification
-            // await _emailService.SendVerificationEmailAsync(request.Email, emailOtp);
+            // Send email verification
+            var emailSent = await _emailService.SendVerificationEmailAsync(request.Email, emailOtp);
+            if (!emailSent)
+                Console.WriteLine($"Failed to send email to {request.Email}");
 
             return Ok(new { Message = "Registration successful. Please check your email for verification code." });
         }
@@ -198,6 +208,103 @@ namespace WaterDelivery.API.Controllers
             });
         }
 
+        [HttpGet("google")]
+        public IActionResult GoogleLogin()
+        {
+            var redirectUrl = Url.Action("GoogleCallback", "Auth");
+            var properties = new AuthenticationProperties { RedirectUri = redirectUrl };
+            return Challenge(properties, GoogleDefaults.AuthenticationScheme);
+        }
+
+        [HttpGet("google-callback")]
+        public async Task<IActionResult> GoogleCallback()
+        {
+            var result = await HttpContext.AuthenticateAsync(GoogleDefaults.AuthenticationScheme);
+
+            if (!result.Succeeded)
+                return BadRequest("Google authentication failed");
+
+            var email = result.Principal.FindFirstValue(ClaimTypes.Email);
+            var name = result.Principal.FindFirstValue(ClaimTypes.Name);
+
+            if (string.IsNullOrEmpty(email))
+                return BadRequest("Email not provided by Google");
+
+            // Check if user exists
+            var user = await _context.Users
+                .Where(u => u.Email == email)
+                .FirstOrDefaultAsync();
+
+            if (user == null)
+            {
+                // Create new user
+                user = new User
+                {
+                    Id = Guid.NewGuid(),
+                    Email = email,
+                    Username = name,
+                    Salt = _passwordService.GenerateSalt(),
+                    AuthProvider = AuthProvider.Google,
+                    IsEmailVerified = true,
+                    CreatedAt = DateTime.UtcNow,
+                    UpdatedAt = DateTime.UtcNow
+                };
+
+                _context.Users.Add(user);
+            }
+
+            // Generate tokens
+            var accessToken = await _jwtService.GenerateAccessTokenAsync(user.Id, user.Email);
+            var refreshToken = await _jwtService.GenerateRefreshTokenAsync();
+
+            // Store refresh token
+            var refreshTokenEntity = new RefreshToken
+            {
+                Id = Guid.NewGuid(),
+                UserId = user.Id,
+                Token = refreshToken,
+                ExpiresAt = DateTime.UtcNow.AddDays(7),
+                CreatedAt = DateTime.UtcNow
+            };
+
+            _context.RefreshTokens.Add(refreshTokenEntity);
+
+            // Update last login
+            user.LastLoginAt = DateTime.UtcNow;
+            user.UpdatedAt = DateTime.UtcNow;
+
+            await _context.SaveChangesAsync();
+
+            return Ok(new
+            {
+                AccessToken = accessToken,
+                RefreshToken = refreshToken,
+                ExpiresIn = 30 * 60,
+                User = new { user.Email, user.Username }
+            });
+        }
+
+        [HttpPost("verify-email")]
+        public async Task<IActionResult> VerifyEmail([FromBody] VerifyEmailRequest request)
+        {
+            if (!await _otpService.ValidateOtpAsync(request.Email, request.Otp, OtpPurpose.EmailVerification))
+                return BadRequest("Invalid or expired OTP");
+
+            var user = await _context.Users
+                .Where(u => u.Email == request.Email)
+                .FirstOrDefaultAsync();
+
+            if (user == null)
+                return NotFound("User not found");
+
+            user.IsEmailVerified = true;
+            user.UpdatedAt = DateTime.UtcNow;
+
+            await _context.SaveChangesAsync();
+
+            return Ok(new { Message = "Email verified successfully" });
+        }
+
         [HttpPost("login/phone")]
         public async Task<IActionResult> LoginWithPhone([FromBody] LoginPhoneRequest request)
         {
@@ -261,36 +368,5 @@ namespace WaterDelivery.API.Controllers
                 ExpiresIn = 30 * 60
             });
         }
-    }
-
-    // Request DTOs
-    public class RegisterUsernameRequest
-    {
-        public string Username { get; set; } = string.Empty;
-        public string Email { get; set; } = string.Empty;
-        public string Password { get; set; } = string.Empty;
-        public string ConfirmPassword { get; set; } = string.Empty;
-    }
-
-    public class RegisterPhoneRequest
-    {
-        public string PhoneNumber { get; set; } = string.Empty;
-    }
-
-    public class VerifyOtpRequest
-    {
-        public string PhoneNumber { get; set; } = string.Empty;
-        public string Otp { get; set; } = string.Empty;
-    }
-
-    public class LoginUsernameRequest
-    {
-        public string Username { get; set; } = string.Empty;
-        public string Password { get; set; } = string.Empty;
-    }
-
-    public class LoginPhoneRequest
-    {
-        public string PhoneNumber { get; set; } = string.Empty;
     }
 }
