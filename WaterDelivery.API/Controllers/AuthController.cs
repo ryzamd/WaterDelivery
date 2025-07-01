@@ -1,5 +1,4 @@
-﻿// WaterDelivery.API/Controllers/AuthController.cs
-using Microsoft.AspNetCore.Authentication;
+﻿using Microsoft.AspNetCore.Authentication;
 using Microsoft.AspNetCore.Authentication.Google;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
